@@ -1,528 +1,179 @@
+"""Generador de audios de entrenamiento.
+
+Lee capturas de pantalla de rutinas y ejercicios, las indexa con Gemini y
+genera una pista MP3 continua con la guía de voz de la rutina.
+"""
+
+import argparse
 import asyncio
-import edge_tts
-from pydub import AudioSegment
 import os
-import json
-import sys
-import bisect
-import time
-import io
-import re
-import zipfile
-import subprocess
 import platform
+import subprocess
+import sys
+from typing import List, Optional
+
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
-load_dotenv()
+from audio import generar_rutina
+from config import CARPETAS_REQUERIDAS, CARPETA_RUTINAS_AUDIOS
+from datos import IndiceEjercicios, cargar_ejercicios, cargar_rutinas
+from indexado import procesar_capturas_de_ejercicios, procesar_capturas_de_rutina
 
-VOZ = "es-AR-ElenaNeural"
-VELOCIDAD_NORMAL = "+0%"
-VELOCIDAD_RAPIDA = "+100%"
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+# ------------------------------------------------------------------ Entorno
 
-if not API_KEY:
-    print("⚠️ No se encontró GEMINI_API_KEY. Copiá '.env.example' a '.env' y cargá tu clave.")
-    print("   El generador de audios funciona igual, pero el escaneo de imágenes estará deshabilitado.")
-    client = None
-else:
+def crear_cliente_gemini():
+    """Cliente de Gemini, o (None, None) si no hay clave configurada.
+
+    Sin clave el generador de audios funciona igual con los JSON existentes;
+    lo único que se deshabilita es el escaneo de imágenes nuevas.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("⚠️ No se encontró GEMINI_API_KEY. Copiá '.env.example' a '.env' y cargá tu clave.")
+        print("   El escaneo de imágenes queda deshabilitado; el resto funciona normal.")
+        return None, None
+
     try:
-        client = genai.Client(api_key=API_KEY)
+        from google import genai
+        from google.genai import types
+        return genai.Client(api_key=api_key), types
     except Exception as e:
-        print(f"⚠️ Error al inicializar Gemini: {e}. El escaneo de imágenes no funcionará.")
-        client = None
+        print(f"⚠️ No se pudo inicializar Gemini: {e}. El escaneo de imágenes no funcionará.")
+        return None, None
 
-ARCHIVO_EJERCICIOS = "ejercicios.json"
-ARCHIVO_RUTINAS = "rutinas.json"
 
-CARPETA_EJERCICIOS = "Ejercicios"
-CARPETA_RUTINAS = "Rutinas"
-
-# SUBCARPETAS DENTRO DE "Rutinas"
-CARPETA_RUTINAS_IMAGENES = os.path.join(CARPETA_RUTINAS, "Imágenes")
-CARPETA_RUTINAS_AUDIOS = os.path.join(CARPETA_RUTINAS, "Audios")
-
-def abrir_carpeta_audios(ruta_carpeta):
-    """Abre la carpeta de audios en el explorador de archivos del sistema operativo."""
+def abrir_carpeta(ruta: str) -> None:
+    """Abre la carpeta en el explorador de archivos del sistema."""
     try:
         if platform.system() == "Windows":
-            os.startfile(ruta_carpeta)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", ruta_carpeta])
-        else:  # Linux / Unix
-            subprocess.run(["xdg-open", ruta_carpeta])
-        print(f"📂 Explorador de archivos abierto en: {ruta_carpeta}")
-    except Exception as e:
-        print(f"⚠️ No se pudo abrir automáticamente la carpeta: {e}")
-
-def descomprimir_zips_whatsapp(carpeta_destino):
-    """
-    Busca archivos .zip que comiencen con 'whatsapp' en la carpeta indicada,
-    extrae todas las imágenes a la raíz de esa carpeta y elimina el archivo zip.
-    Si no hay archivos ZIP, continúa normalmente.
-    """
-    if not os.path.exists(carpeta_destino):
-        return
-
-    archivos_zip = [f for f in os.listdir(carpeta_destino) if f.lower().startswith("whatsapp") and f.lower().endswith(".zip")]
-
-    for nombre_zip in archivos_zip:
-        ruta_zip = os.path.join(carpeta_destino, nombre_zip)
-        print(f"📦 Descomprimiendo archivo ZIP encontrado: '{nombre_zip}' en '{carpeta_destino}'...")
-
-        try:
-            with zipfile.ZipFile(ruta_zip, 'r') as zip_ref:
-                for member in zip_ref.infolist():
-                    if member.is_dir() or os.path.basename(member.filename).startswith('.'):
-                        continue
-                    
-                    nombre_archivo_limpio = os.path.basename(member.filename)
-                    if nombre_archivo_limpio:
-                        ruta_salida = os.path.join(carpeta_destino, nombre_archivo_limpio)
-                        with zip_ref.open(member) as fuente, open(ruta_salida, "wb") as destino:
-                            destino.write(fuente.read())
-
-            os.remove(ruta_zip)
-            print(f"🗑️ Archivo comprimido '{nombre_zip}' procesado y eliminado.")
-
-        except Exception as e:
-            print(f"❌ Error al descomprimir '{nombre_zip}': {e}")
-
-def cargar_rutinas():
-    if os.path.exists(ARCHIVO_RUTINAS):
-        with open(ARCHIVO_RUTINAS, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                print(f"❌ Error crítico: El archivo '{ARCHIVO_RUTINAS}' tiene un formato JSON inválido.")
-                sys.exit()
-    else:
-        ejemplo = {"Pecho": [{"nombre": "Círculos con los Brazos", "seg": 30, "cambio_lado": False}]}
-        with open(ARCHIVO_RUTINAS, "w", encoding="utf-8") as f:
-            json.dump(ejemplo, f, ensure_ascii=False, indent=4)
-        return ejemplo
-
-def guardar_rutinas(datos):
-    with open(ARCHIVO_RUTINAS, "w", encoding="utf-8") as f:
-        json.dump(datos, f, ensure_ascii=False, indent=4)
-
-def cargar_ejercicios_globales():
-    if os.path.exists(ARCHIVO_EJERCICIOS):
-        with open(ARCHIVO_EJERCICIOS, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-    return {}
-
-def guardar_ejercicios_globales_ordenados(datos):
-    datos_ordenados = {k: datos[k] for k in sorted(datos.keys())}
-    with open(ARCHIVO_EJERCICIOS, "w", encoding="utf-8") as f:
-        json.dump(datos_ordenados, f, ensure_ascii=False, indent=4)
-
-def buscar_ejercicio_eficiente(nombre_ejercicio, lista_claves_ordenada):
-    index = bisect.bisect_left(lista_claves_ordenada, nombre_ejercicio)
-    if index < len(lista_claves_ordenada) and lista_claves_ordenada[index] == nombre_ejercicio:
-        return True
-    return False
-
-def obtener_clave_orden_whatsapp(nombre_archivo):
-    """
-    Ordena correctamente las imágenes de WhatsApp:
-    1. Base sin número (se le asigna el índice 0) -> va PRIMERO.
-    2. Versiones con (1), (2), (10) -> van en orden numérico creciente.
-    """
-    patron = r'^(.*?)(?:\s*\((\d+)\))?\.[a-zA-Z0-9]+$'
-    match = re.match(patron, nombre_archivo)
-    
-    if match:
-        base = match.group(1).lower()
-        numero_sub = int(match.group(2)) if match.group(2) else 0
-        return (base, numero_sub)
-    
-    return (nombre_archivo.lower(), 0)
-
-def procesar_imagenes_rutinas():
-    descomprimir_zips_whatsapp(CARPETA_RUTINAS_IMAGENES)
-
-    if not client or not os.path.exists(CARPETA_RUTINAS_IMAGENES):
-        return
-
-    extensiones_validas = (".png", ".jpg", ".jpeg", ".webp")
-    archivos_crudos = [f for f in os.listdir(CARPETA_RUTINAS_IMAGENES) if f.lower().startswith("whatsapp") and f.lower().endswith(extensiones_validas)]
-
-    if not archivos_crudos:
-        return
-
-    archivos = sorted(archivos_crudos, key=obtener_clave_orden_whatsapp)
-
-    print(f"\n📋 Se encontraron {len(archivos)} imágenes nuevas de rutina en '{CARPETA_RUTINAS_IMAGENES}'...")
-    print("📌 Orden de lectura de imágenes:")
-    for idx, arch in enumerate(archivos, start=1):
-        print(f"   {idx}. {arch}")
-
-    partes_imagenes = []
-    for nombre_archivo in archivos:
-        ruta_origen = os.path.join(CARPETA_RUTINAS_IMAGENES, nombre_archivo)
-        ext = os.path.splitext(nombre_archivo)[1]
-        with open(ruta_origen, "rb") as f:
-            bytes_imagen = f.read()
-        mime = "image/png" if ext.lower() == ".png" else "image/jpeg"
-        partes_imagenes.append(types.Part.from_bytes(data=bytes_imagen, mime_type=mime))
-
-    prompt = """
-    Analiza TODAS las capturas de pantalla adjuntas enviadas EN ESTE ORDEN ESTRICTO.
-    
-    1. 'nombre_rutina': Extrae el título principal de la rutina (encabezado superior de la PRIMERA imagen).
-    2. 'ejercicios': Procesa las imágenes de la primera a la última de manera secuencial y mantén ese orden en la lista resultante.
-       - 'nombre': Nombre exacto del ejercicio.
-       - 'seg': Duración convertida a segundos (ej. 0:30 = 30, 1:00 = 60).
-       - 'cambio_lado': true si tiene la burbuja con flechas (⇄), false en caso contrario.
-    """
-
-    try:
-        print("\n⏳ Consultando a Gemini para procesar las imágenes...")
-        time.sleep(2)
-        respuesta = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[*partes_imagenes, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "OBJECT",
-                    "properties": {
-                        "nombre_rutina": {"type": "STRING"},
-                        "ejercicios": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "nombre": {"type": "STRING"},
-                                    "seg": {"type": "INTEGER"},
-                                    "cambio_lado": {"type": "BOOLEAN"}
-                                },
-                                "required": ["nombre", "seg", "cambio_lado"]
-                            }
-                        }
-                    },
-                    "required": ["nombre_rutina", "ejercicios"]
-                }
-            )
-        )
-
-        datos_rutina = json.loads(respuesta.text.strip())
-        nombre_rutina = datos_rutina.get("nombre_rutina", "").strip()
-        lista_ejercicios = datos_rutina.get("ejercicios", [])
-
-        if not nombre_rutina or not lista_ejercicios:
-            print("❌ No se pudo extraer la información completa de la rutina.")
-            return
-
-        rutinas_actuales = cargar_rutinas()
-        rutinas_actuales[nombre_rutina] = lista_ejercicios
-        guardar_rutinas(rutinas_actuales)
-        print(f"✅ Rutina '{nombre_rutina}' guardada correctamente ({len(lista_ejercicios)} ejercicios).")
-
-        nombre_seguro_rutina = "".join(x for x in nombre_rutina if x.isalnum() or x in "._- ")
-        for idx, nombre_archivo in enumerate(archivos, start=1):
-            ext = os.path.splitext(nombre_archivo)[1]
-            ruta_origen = os.path.join(CARPETA_RUTINAS_IMAGENES, nombre_archivo)
-            nuevo_nombre_foto = f"{nombre_seguro_rutina} {idx}{ext.lower()}"
-            ruta_destino = os.path.join(CARPETA_RUTINAS_IMAGENES, nuevo_nombre_foto)
-
-            if os.path.exists(ruta_destino):
-                os.remove(ruta_destino)
-
-            os.rename(ruta_origen, ruta_destino)
-            print(f"📸 Imagen de rutina renombrada: '{nuevo_nombre_foto}'")
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        print(f"❌ Error al procesar la rutina: {e}")
-        if any(k in error_msg for k in ["quota", "limit", "exhausted", "429", "token"]):
-            print("🛑 [DETENCIÓN DE SEGURIDAD] Límite de cuota detectado al procesar la rutina.")
-
-def procesar_imagenes_nuevas_whatsapp():
-    descomprimir_zips_whatsapp(CARPETA_EJERCICIOS)
-
-    if not client or not os.path.exists(CARPETA_EJERCICIOS):
-        return
-
-    ejercicios_globales = cargar_ejercicios_globales()
-    hubo_cambios = False
-
-    extensiones_validas = (".png", ".jpg", ".jpeg", ".webp")
-    archivos = [f for f in os.listdir(CARPETA_EJERCICIOS) if f.lower().startswith("whatsapp") and f.lower().endswith(extensiones_validas)]
-
-    if not archivos:
-        return
-
-    print(f"\n🔍 Se encontraron {len(archivos)} imágenes nuevas de ejercicios en '{CARPETA_EJERCICIOS}'...")
-
-    for nombre_archivo in archivos:
-        ruta_origen = os.path.join(CARPETA_EJERCICIOS, nombre_archivo)
-        ext = os.path.splitext(nombre_archivo)[1]
-
-        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
-        if nombre_sin_ext in ejercicios_globales:
-            print(f"⚡ El ejercicio '{nombre_sin_ext}' ya está indexado. Salteando llamada a la API.")
-            continue
-
-        print(f"📸 Analizando ejercicio crudo: {nombre_archivo}...")
-
-        try:
-            with open(ruta_origen, "rb") as f:
-                bytes_imagen = f.read()
-            mime = "image/png" if ext.lower() == ".png" else "image/jpeg"
-            imagen_input = types.Part.from_bytes(data=bytes_imagen, mime_type=mime)
-
-            prompt = "Transcribe el título principal en 'nombre' y todo el texto restante (INSTRUCCIONES y CONSEJOS) en 'texto'."
-            
-            print("⏳ Esperando 12 segundos para cuidar la cuota de la API...")
-            time.sleep(12)
-
-            respuesta = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[imagen_input, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "OBJECT",
-                        "properties": {
-                            "nombre": {"type": "STRING"},
-                            "texto": {"type": "STRING"}
-                        },
-                        "required": ["nombre", "texto"]
-                    }
-                )
-            )
-            
-            datos_ia = json.loads(respuesta.text.strip())
-            nombre_ejercicio = datos_ia.get("nombre", "").strip()
-            texto_transcrito = datos_ia.get("texto", "").strip()
-
-            if not nombre_ejercicio or nombre_ejercicio.upper() in ["INSTRUCCIONES", "CONSEJOS"]:
-                print(f"❌ Nombre inválido detectado en {nombre_archivo}: '{nombre_ejercicio}'. Reintentando...")
-                continue
-
-            # --- LIMPIEZA LOCAL Y FORMATEO DE TÍTULOS ---
-            texto_transcrito = texto_transcrito.replace('\n', ' ')
-            texto_transcrito = re.sub(r' +', ' ', texto_transcrito).strip()
-
-            texto_transcrito = re.sub(r'\b(INSTRUCCIONES|CONSEJOS)\b(?!\s*:)', r'\1:', texto_transcrito, flags=re.IGNORECASE)
-            texto_transcrito = re.sub(r'\b(INSTRUCCIONES|CONSEJOS):(\S)', r'\1: \2', texto_transcrito, flags=re.IGNORECASE)
-
-            ejercicios_globales[nombre_ejercicio] = texto_transcrito
-            hubo_cambios = True
-
-            nombre_seguro = "".join(x for x in nombre_ejercicio if x.isalnum() or x in "._- ")
-            ruta_destino = os.path.join(CARPETA_EJERCICIOS, f"{nombre_seguro}{ext.lower()}")
-
-            if os.path.exists(ruta_destino):
-                os.remove(ruta_destino)
-
-            os.rename(ruta_origen, ruta_destino)
-            print(f"💾 Éxito: Imagen renombrada a '{nombre_seguro}{ext.lower()}' e indexada.")
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            print(f"❌ Error al procesar la imagen {nombre_archivo}: {e}")
-            if any(k in error_msg for k in ["quota", "limit", "exhausted", "429", "token"]):
-                print("\n🛑 [DETENCIÓN DE SEGURIDAD] Se detectó un límite de tokens o cuotas en Gemini.")
-                break
-
-    if hubo_cambios:
-        guardar_ejercicios_globales_ordenados(ejercicios_globales)
-        print(f"📝 Archivo '{ARCHIVO_EJERCICIOS}' guardado y actualizado con éxito.")
-
-async def generar_audio_palabra(palabra, velocidad=VELOCIDAD_NORMAL):
-    comunicacion = edge_tts.Communicate(palabra, VOZ, rate=velocidad)
-    buffer = io.BytesIO()
-    async for chunk in comunicacion.stream():
-        if chunk["type"] == "audio":
-            buffer.write(chunk["data"])
-    buffer.seek(0)
-    return AudioSegment.from_file(buffer, format="mp3")
-
-async def generar_audio_ejercicio(nombre_ejercicio, texto_instrucciones, segundos, cambio_lado, audio_cambio_base, audio_preparacion_siguiente):
-    ms_bloque_2s = 2000
-    ms_bloque_4s = 4000
-
-    texto_anuncio = f"Ejercicio por empezar. {nombre_ejercicio}."
-    audio_anuncio_base = await generar_audio_palabra(texto_anuncio, VELOCIDAD_NORMAL)
-    silencio_anuncio = AudioSegment.silent(duration=max(0, ms_bloque_2s - len(audio_anuncio_base)))
-    audio_anuncio_final = (audio_anuncio_base + silencio_anuncio)[:ms_bloque_2s]
-
-    texto_completo_ejercicio = f"{nombre_ejercicio}. {texto_instrucciones}"
-    comunicacion = edge_tts.Communicate(texto_completo_ejercicio, VOZ, rate=VELOCIDAD_RAPIDA)
-    audio_buffer = io.BytesIO()
-    
-    async for chunk in comunicacion.stream():
-        if chunk["type"] == "audio":
-            audio_buffer.write(chunk["data"])
-            
-    audio_buffer.seek(0)
-    audio_voz_rapida = AudioSegment.from_file(audio_buffer, format="mp3")
-    
-    ms_originales = int(segundos * 1000)
-    ms_base_rapida = len(audio_voz_rapida)
-    
-    if ms_base_rapida >= ms_originales:
-        audio_ejecucion_plana = audio_voz_rapida[:ms_originales]
-    else:
-        veces_completas = ms_originales // ms_base_rapida
-        resto_ms = ms_originales % ms_base_rapida
-        audio_ejecucion_plana = (audio_voz_rapida * veces_completas) + audio_voz_rapida[:resto_ms]
-    
-    audio_ejecucion_plana = audio_ejecucion_plana.fade_out(500)
-
-    if cambio_lado:
-        mitad_ms = ms_originales // 2
-        silencio_aviso = AudioSegment.silent(duration=max(0, ms_bloque_4s - len(audio_cambio_base)))
-        bloque_cambio = (audio_cambio_base + silencio_aviso)[:ms_bloque_4s]
-        audio_ejecucion_final = audio_ejecucion_plana[:mitad_ms] + bloque_cambio + audio_ejecucion_plana[mitad_ms:]
-    else:
-        audio_ejecucion_final = audio_ejecucion_plana
-
-    silencio_relleno = AudioSegment.silent(duration=max(0, ms_bloque_4s - len(audio_preparacion_siguiente)))
-    bloque_preparacion = (audio_preparacion_siguiente + silencio_relleno)[:ms_bloque_4s]
-    
-    audio_bloque_total = audio_anuncio_final + audio_ejecucion_final + bloque_preparacion
-    return audio_bloque_total
-
-async def principal(nombres_rutinas):
-    rutinas_config = cargar_rutinas()
-
-    if isinstance(nombres_rutinas, str):
-        nombres_rutinas = [nombres_rutinas]
-
-    for nr in nombres_rutinas:
-        if nr not in rutinas_config:
-            print(f"❌ La rutina '{nr}' no existe en '{ARCHIVO_RUTINAS}'.")
-            return
-
-    nombre_unificado = " + ".join(nombres_rutinas)
-    nombre_seguro_unificado = "".join(x for x in nombre_unificado if x.isalnum() or x in "._- +")
-
-    if not os.path.exists(CARPETA_RUTINAS_AUDIOS):
-        os.makedirs(CARPETA_RUTINAS_AUDIOS)
-
-    ejercicios_globales = cargar_ejercicios_globales()
-    claves_ordenadas = sorted(list(ejercicios_globales.keys()))
-
-    lista_ejercicios = []
-    for nr in nombres_rutinas:
-        lista_ejercicios.extend(rutinas_config[nr])
-        
-    cantidad_ejercicios = len(lista_ejercicios)
-
-    # VERIFICACIÓN PREVIA DE EJERCICIOS INDEXADOS
-    for ej in lista_ejercicios:
-        nombre_ejercicio = ej["nombre"]
-        if not buscar_ejercicio_eficiente(nombre_ejercicio, claves_ordenadas):
-            print(f"\n🔍 El ejercicio '{nombre_ejercicio}' no está indexado. Verificando si hay imágenes sin procesar...")
-            procesar_imagenes_nuevas_whatsapp()
-            
-            # Recargar la base de datos tras el escaneo
-            ejercicios_globales = cargar_ejercicios_globales()
-            claves_ordenadas = sorted(list(ejercicios_globales.keys()))
-            
-            # Verificar nuevamente
-            if not buscar_ejercicio_eficiente(nombre_ejercicio, claves_ordenadas):
-                print(f"🛑 [ABORTADO] El ejercicio '{nombre_ejercicio}' no está indexado ni se encontraron imágenes para procesarlo. No se generará el audio.")
-                return
-
-    print("🎙️ Inicializando alertas de voz...")
-    audio_cambio_base = await generar_audio_palabra("Cambio de lado.", VELOCIDAD_NORMAL)
-
-    print(f"\n🚀 Iniciando generación de la rutina unificada: {nombre_unificado}")
-    
-    audio_completo_rutina = AudioSegment.empty()
-
-    for i in range(cantidad_ejercicios):
-        ej = lista_ejercicios[i]
-        nombre_ejercicio = ej["nombre"]
-        segundos = ej["seg"]
-        cambio_lado = ej.get("cambio_lado", False)
-
-        instrucciones = ejercicios_globales[nombre_ejercicio]
-        
-        if i + 1 < cantidad_ejercicios:
-            siguiente_nombre = lista_ejercicios[i + 1]["nombre"]
-            texto_preparacion = f"Preparación para el próximo ejercicio. {siguiente_nombre}."
+            os.startfile(ruta)                                   # type: ignore[attr-defined]
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", ruta], check=False)
         else:
-            texto_preparacion = "Rutina finalizada. Excelente entrenamiento."
-            
-        audio_preparacion_siguiente = await generar_audio_palabra(texto_preparacion, VELOCIDAD_NORMAL)
-        
-        audio_fragmento = await generar_audio_ejercicio(
-            nombre_ejercicio,
-            instrucciones, 
-            segundos, 
-            cambio_lado, 
-            audio_cambio_base, 
-            audio_preparacion_siguiente
-        )
-        
-        audio_completo_rutina += audio_fragmento
+            subprocess.run(["xdg-open", ruta], check=False)
+        print(f"📂 Explorador abierto en: {ruta}")
+    except Exception as e:
+        print(f"⚠️ No se pudo abrir la carpeta automáticamente: {e}")
 
-    if len(audio_completo_rutina) > 0:
-        ruta_final_unificada = os.path.join(CARPETA_RUTINAS_AUDIOS, f"{nombre_seguro_unificado}.mp3")
-        
-        print(f"\n💾 Exportando pista completa unificada...")
-        audio_completo_rutina.export(
-            ruta_final_unificada,
-            format="mp3",
-            bitrate="192k",
-            parameters=["-id3v2_version", "3"]
-        )
-        print(f"✅ ¡Éxito! Archivo de audio unificado guardado en: {ruta_final_unificada}")
-        
-        # ABRIR LA CARPETA DE AUDIOS
-        abrir_carpeta_audios(CARPETA_RUTINAS_AUDIOS)
-    else:
-        print("❌ No se pudo generar ningún audio para esta rutina.")
 
-if __name__ == "__main__":
-    if not os.path.exists(CARPETA_EJERCICIOS):
-        os.makedirs(CARPETA_EJERCICIOS)
-    if not os.path.exists(CARPETA_RUTINAS_IMAGENES):
-        os.makedirs(CARPETA_RUTINAS_IMAGENES)
-    if not os.path.exists(CARPETA_RUTINAS_AUDIOS):
-        os.makedirs(CARPETA_RUTINAS_AUDIOS)
+# --------------------------------------------------------------- Selección
 
-    procesar_imagenes_rutinas()
-    procesar_imagenes_nuevas_whatsapp()
-    
-    rutinas_config = cargar_rutinas()
-    opciones_rutinas = list(rutinas_config.keys())
-    
+def menu_interactivo(opciones: List[str]) -> List[str]:
     print("\n==========================================")
     print("      GENERADOR DE AUDIOS DE ENTRENAMIENTO")
     print("==========================================")
     print("Rutinas disponibles en la base de datos:")
-    for idx, nombre_r in enumerate(opciones_rutinas, 1):
-        print(f"  [{idx}] {nombre_r}")
+    for i, nombre in enumerate(opciones, 1):
+        print(f"  [{i}] {nombre}")
     print("==========================================")
     print("Escribí los números de las rutinas que quieras procesar.")
     print("Si querés combinar varias, sepáralas con una coma (ejemplo: 1, 2)")
-    
+
     seleccion = input("👉 Selección: ").strip()
-    
-    rutinas_elegidas = []
-    partes = [p.strip() for p in seleccion.split(",") if p.strip()]
-    
-    for p in partes:
-        if p.isdigit():
-            indice = int(p) - 1
-            if 0 <= indice < len(opciones_rutinas):
-                rutinas_elegidas.append(opciones_rutinas[indice])
-        elif p in rutinas_config:
-            rutinas_elegidas.append(p)
-            
-    if rutinas_elegidas:
-        asyncio.run(principal(rutinas_elegidas))
-    else:
+    return resolver_seleccion(seleccion.split(","), opciones)
+
+
+def resolver_seleccion(partes, opciones: List[str]) -> List[str]:
+    """Traduce números o nombres a nombres de rutina válidos, en orden."""
+    elegidas = []
+    for parte in (p.strip() for p in partes):
+        if not parte:
+            continue
+        if parte.isdigit() and 1 <= int(parte) <= len(opciones):
+            elegidas.append(opciones[int(parte) - 1])
+        elif parte in opciones:
+            elegidas.append(parte)
+        else:
+            print(f"⚠️ Se ignora '{parte}': no es una rutina válida.")
+    return elegidas
+
+
+def verificar_indexado(elegidas: List[str], rutinas, indice: IndiceEjercicios,
+                       client, types) -> Optional[IndiceEjercicios]:
+    """Comprueba que todos los ejercicios estén indexados.
+
+    Si falta alguno, intenta escanear una única vez las imágenes pendientes.
+    Devuelve el índice actualizado, o None si sigue faltando algo.
+    """
+    nombres = [ej["nombre"] for r in elegidas for ej in rutinas[r]]
+    faltantes = indice.faltantes(nombres)
+    if not faltantes:
+        return indice
+
+    print(f"\n🔍 Faltan {len(faltantes)} ejercicios en el índice. Buscando imágenes sin procesar...")
+    if procesar_capturas_de_ejercicios(client, types, indice):
+        indice = cargar_ejercicios()
+        faltantes = indice.faltantes(nombres)
+
+    if faltantes:
+        print("\n🛑 [ABORTADO] No se generó el audio. Faltan indexar:")
+        for nombre in faltantes:
+            print(f"   • {nombre}")
+        print(f"\n   Agregá sus capturas a la carpeta de ejercicios y volvé a correr el script,")
+        print(f"   o cargalos a mano en el índice de ejercicios.")
+        return None
+
+    return indice
+
+
+# -------------------------------------------------------------------- Main
+
+def parsear_argumentos() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Genera un MP3 guiado por voz a partir de una o varias rutinas.")
+    parser.add_argument(
+        "rutinas", nargs="*",
+        help="Nombres o números de las rutinas a encadenar. Sin argumentos, "
+             "se abre el menú interactivo.")
+    parser.add_argument(
+        "--sin-escaneo", action="store_true",
+        help="No consulta a Gemini: usa solamente los índices ya guardados.")
+    parser.add_argument(
+        "--no-abrir", action="store_true",
+        help="No abre el explorador de archivos al terminar.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    load_dotenv()
+    args = parsear_argumentos()
+
+    for carpeta in CARPETAS_REQUERIDAS:
+        os.makedirs(carpeta, exist_ok=True)
+
+    client, types = (None, None) if args.sin_escaneo else crear_cliente_gemini()
+
+    if client:
+        procesar_capturas_de_rutina(client, types)
+
+    indice = cargar_ejercicios()
+    if client:
+        procesar_capturas_de_ejercicios(client, types, indice)
+
+    rutinas = cargar_rutinas()
+    opciones = list(rutinas)
+    if not opciones:
+        print("❌ No hay ninguna rutina cargada.")
+        return 1
+
+    elegidas = (resolver_seleccion(args.rutinas, opciones) if args.rutinas
+                else menu_interactivo(opciones))
+    if not elegidas:
         print("❌ No seleccionaste ninguna rutina válida.")
+        return 1
+
+    indice = verificar_indexado(elegidas, rutinas, indice, client, types)
+    if indice is None:
+        return 1
+
+    print(f"\n🚀 Rutina a generar: {' + '.join(elegidas)}")
+    asyncio.run(generar_rutina(elegidas, rutinas, indice))
+
+    if not args.no_abrir:
+        abrir_carpeta(CARPETA_RUTINAS_AUDIOS)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
