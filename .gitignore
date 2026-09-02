@@ -1,0 +1,32 @@
+# ---- Secretos ----
+.env
+*.key
+
+# ---- Entorno virtual ----
+venv/
+.venv/
+env/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Datos personales del usuario ----
+# Capturas de la app de entrenamiento y textos transcritos.
+# Contenido de terceros: cada usuario aporta el suyo.
+Ejercicios/
+Rutinas/
+ejercicios.json
+rutinas.json
+
+# ---- Salidas generadas ----
+*.mp3
+*.wav
+
+# ---- Editor / SO ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

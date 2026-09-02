@@ -1,0 +1,14 @@
+{
+    "Rutina de ejemplo": [
+        {
+            "nombre": "Balanceo de Brazos",
+            "seg": 30,
+            "cambio_lado": false
+        },
+        {
+            "nombre": "Postura del Niño",
+            "seg": 60,
+            "cambio_lado": true
+        }
+    ]
+}
