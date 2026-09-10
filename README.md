@@ -45,13 +45,13 @@ Cada ejercicio se arma como tres bloques concatenados:
 
 | Bloque | Duración | Contenido |
 |---|---|---|
-| Anuncio | 2 s exactos | «Ejercicio por empezar. *{nombre}*.» |
+| Anuncio | 2 s exactos | «Ahora, *{nombre}*.» |
 | Ejecución | `seg` s exactos | Nombre + instrucciones a **+100 %** de velocidad, en loop hasta llenar el tiempo, con *fade out* de 500 ms |
-| Preparación | 4 s exactos | «Preparación para el próximo ejercicio. *{siguiente}*.» |
+| Preparación | 4 s exactos | «Próximo ejercicio. *{siguiente}*.» |
 
 Si el ejercicio tiene `cambio_lado`, a la mitad exacta del bloque de ejecución se inserta un aviso de 4 s: «Cambio de lado.»
 
-Los bloques de anuncio y preparación tienen duración fija, y muchos nombres de ejercicio no entran a velocidad normal. En vez de cortar la frase, se vuelve a sintetizar acelerada lo justo para que quepa (`bloque_fijo` en `audio.py`): el ritmo del audio queda clavado y no se pierde ni una palabra. Si preferís que la voz nunca se apure, subí `MS_BLOQUE_ANUNCIO` en `config.py`.
+Los bloques de anuncio y preparación tienen duración fija. Las dos frases son cortas a propósito: las fórmulas largas que usaban antes gastaban ocho y trece sílabas antes de llegar al nombre, y eran las que no dejaban entrar la frase en su caja. Son las mismas que usa la versión web, para que las dos digan lo mismo. Aun así, los nombres más largos no entran a velocidad normal: en vez de cortarlos, se vuelven a sintetizar acelerados lo justo para que quepan (`anunciar`, `preparar` y `bloque_fijo` en `audio.py`). El ritmo del audio queda clavado y no se pierde ni una palabra. Si preferís que la voz nunca se apure, subí `MS_BLOQUE_ANUNCIO` en `config.py`.
 
 La síntesis de todas las frases se lanza en paralelo (hasta `MAX_SINTESIS_SIMULTANEAS` pedidos a la vez) y cada frase se genera una sola vez, aunque un ejercicio se repita en varias rutinas encadenadas. El armado posterior es local y respeta el orden original.
 

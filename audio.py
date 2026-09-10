@@ -33,6 +33,27 @@ TEXTO_CAMBIO_LADO = "Cambio de lado."
 TEXTO_FINAL = "Rutina finalizada. Excelente entrenamiento."
 
 
+def anunciar(nombre: str) -> str:
+    """Aviso de arranque del ejercicio, en el bloque de 2 s.
+
+    Corto a propósito: «Ejercicio por empezar» son ocho sílabas antes de llegar
+    al nombre, y eran justo las que obligaban a acelerar el anuncio para que
+    entrara en la caja. En un audio que se escucha veinte veces, además, la
+    fórmula larga cansa.
+    """
+    return f"Ahora, {nombre}."
+
+
+def preparar(siguiente: str) -> str:
+    """Aviso del ejercicio que viene, en el bloque de 4 s.
+
+    Corto por el mismo motivo que `anunciar`: «Preparación para el próximo
+    ejercicio» son trece sílabas antes del nombre. Misma frase que usa la
+    versión web, para que las dos digan lo mismo.
+    """
+    return f"Próximo ejercicio. {siguiente}."
+
+
 # ------------------------------------------------------- Helpers de audio
 
 def _normalizar(audio: AudioSegment) -> AudioSegment:
@@ -194,13 +215,12 @@ async def generar_rutina(nombres_rutinas: List[str], rutinas: Dict[str, list],
         instrucciones = indice.obtener(nombre)
 
         tareas_anuncio.append(
-            sintetizador.bloque_fijo(f"Ejercicio por empezar. {nombre}.", MS_BLOQUE_ANUNCIO))
+            sintetizador.bloque_fijo(anunciar(nombre), MS_BLOQUE_ANUNCIO))
         tareas_ejecucion.append(
             sintetizador.voz_de(f"{nombre}. {instrucciones}", VELOCIDAD_RAPIDA))
 
         siguiente = ejercicios[i + 1]["nombre"] if i + 1 < total else None
-        texto_prep = (f"Preparación para el próximo ejercicio. {siguiente}."
-                      if siguiente else TEXTO_FINAL)
+        texto_prep = preparar(siguiente) if siguiente else TEXTO_FINAL
         tareas_preparacion.append(
             sintetizador.bloque_fijo(texto_prep, MS_BLOQUE_PREPARACION))
 
